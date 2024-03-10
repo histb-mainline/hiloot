@@ -298,7 +298,7 @@ class Device:
 
         self.load(0, len(image), image, 'bootimg', print_user)
 
-        if chip.chipid <= 3 and chip.ca and params.multi_param and params.asc:
+        if chip.chipid in (2, 3) and chip.ca and params.multi_param and params.asc:
             asc_data = memoryview(params.asc.data)
             self.load(
                 params.asc.addr, 0x400, asc_data[:0x400],
