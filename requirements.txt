@@ -1,0 +1,5 @@
+pyserial
+pyserial-asyncio
+pycryptodome
+tqdm[tui]
+colorama[tui] ; platform_system == "Windows"
