@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+"""Parse, split, or shrink `fastboot.bin`."""
+
 from enum import IntEnum
 from typing import TYPE_CHECKING, NamedTuple
 

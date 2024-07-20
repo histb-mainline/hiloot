@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+"""
+Display HiSTB bootrom reg files (usually located in
+`<SDK>/source/boot/sysreg/`), or convert them from / to editable ini files.
+"""
+
 from collections import OrderedDict
 from datetime import datetime
 from enum import IntEnum

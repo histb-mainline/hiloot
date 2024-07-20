@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+"""Boot HiSTB devices via (USB-)serial port."""
+
 import asyncio
 import binascii
 from enum import IntEnum, auto

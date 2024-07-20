@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
-"""U-Boot fw-utils fw_printenv / fw_setenv replacement, but more permissive."""
+"""
+Display or compile U-Boot environ file.
+
+U-Boot fw-utils `fw_printenv` / `fw_setenv` replacement, but more permissive.
+"""
 
 import binascii
 from collections import OrderedDict
