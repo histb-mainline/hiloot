@@ -8,7 +8,7 @@ U-Boot fw-utils `fw_printenv` / `fw_setenv` replacement, but more permissive.
 
 import binascii
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, BinaryIO, Mapping
 
 if TYPE_CHECKING:
     from _typeshed import SupportsRead, SupportsWrite
@@ -21,7 +21,7 @@ class UBootEnvError(Exception):
     __slots__ = ()
 
 
-def readenv(stream: 'SupportsRead[bytes]', size=0):
+def readenv(stream: 'SupportsRead[bytes]', size: int = 0):
     """Read the U-Boot environment variables from a file into a dict."""
     if 0 < size < 6:
         raise UBootEnvError('size too small')
@@ -67,8 +67,8 @@ def main():
     import sys
     import os.path
 
-    def printerr(*args, **kwargs):
-        print(*args, file=sys.stderr, **kwargs)
+    def printerr(*args, **kwargs):  # type: ignore
+        print(*args, file=sys.stderr, **kwargs)  # type: ignore
 
     parser = argparse.ArgumentParser(
         description='Read, set or generate U-Boot environ file.')
@@ -107,7 +107,20 @@ def main():
         'set', metavar='KEY=VALUE', nargs='*', type=lambda x: x.encode(),
         help='the variables to be set')
 
-    args = parser.parse_args()
+    class MyArgs(argparse.Namespace):
+        in_offset: int
+        in_size: int
+        verify: bool
+        ignore: bool
+        get: list[bytes]
+        script: BinaryIO | None
+        file: str
+        out_offset: int
+        out_size: int
+        in_file: BinaryIO | None
+        set: list[bytes]
+
+    args = parser.parse_args(namespace=MyArgs())
 
     if not args.in_file and not args.out_path:
         printerr('Error: No action specified, use -h to see help')

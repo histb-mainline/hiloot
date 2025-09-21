@@ -9,7 +9,7 @@ from collections import OrderedDict
 from datetime import datetime
 from enum import IntEnum
 from io import BufferedReader, BytesIO
-from typing import TYPE_CHECKING, BinaryIO, Mapping, NamedTuple
+from typing import IO, TYPE_CHECKING, AnyStr, BinaryIO, Mapping, NamedTuple, TextIO
 import warnings
 
 if TYPE_CHECKING:
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 __all__ = ['Register', 'RegModuleType', 'RegModule', 'RegBinFormat', 'RegBin']
 
 
-def mustread(buf: 'SupportsRead[bytes]', size=1):
+def mustread(buf: 'SupportsRead[bytes]', size: int = 1):
     if not size:
         return b''
 
@@ -29,7 +29,9 @@ def mustread(buf: 'SupportsRead[bytes]', size=1):
     return data
 
 
-def readuntil(buf: 'SupportsRead[bytes]', delimiter=0, including=False):
+def readuntil(
+        buf: 'SupportsRead[bytes]', delimiter: int = 0,
+        including: bool = False):
     ret = bytearray()
     while True:
         data = mustread(buf)
@@ -41,7 +43,7 @@ def readuntil(buf: 'SupportsRead[bytes]', delimiter=0, including=False):
     return bytes(ret)
 
 
-def mustwithin(buf: BinaryIO, size: int):
+def mustwithin(buf: IO[AnyStr], size: int):
     if not size:
         return
 
@@ -128,7 +130,7 @@ class Register(NamedTuple):
         return shift, count
 
     @property
-    def count(self):
+    def count_(self):
         return self.sftcnt[1]
 
     def to_ini(self):
@@ -262,7 +264,7 @@ class Register(NamedTuple):
             value = int(value_s, 0)
             mask = 0xffffffff if mask_s == '-' else int(mask_s, 0)
             delay = int(delay_s, 0)
-        except ValueError as e:
+        except ValueError:
             raise ValueError(f'non-numeric arguments in register {toks[0]}')
         readonly = readonly_s == 'r'
 
@@ -281,7 +283,7 @@ class Register(NamedTuple):
         return bool(int.from_bytes(buf.peek(4)[:4]))
 
     @classmethod
-    def load_reg(cls, buf: BufferedReader):
+    def load_reg(cls, buf: 'SupportsRead[bytes]'):
         data = mustread(buf, 0x10)
         addr = int.from_bytes(data[0x0:0x4], 'little')
         value_sft = int.from_bytes(data[0x4:0x8], 'little')
@@ -303,7 +305,7 @@ class Register(NamedTuple):
             readonly), flags
 
     @classmethod
-    def load_cfg(cls, buf: BufferedReader, base: int):
+    def load_cfg(cls, buf: 'SupportsRead[bytes]', base: int):
         attrs = mustread(buf)[0]
         op = attrs & 0xf
         if op not in [0, 2, 3, 4]:
@@ -321,7 +323,7 @@ class Register(NamedTuple):
         return cls(addr, value, mask, 0, op == 2 or op == 4), None
 
     @classmethod
-    def load_v120(cls, buf: BufferedReader, base: int):
+    def load_v120(cls, buf: 'SupportsRead[bytes]', base: int):
         data = mustread(buf, 3)
         addr = base + data[0]
         value_len = (data[1] & 0xe0) >> 5
@@ -383,7 +385,7 @@ class RegModule(NamedTuple):
         # it might be possible that we can use any base, but be safe here
         return min(reg.addr for reg in self.regs) & ~0xff
 
-    def find_block_v120(self, start=0):
+    def find_block_v120(self, start: int = 0):
         base = self.regs[start].addr & ~0xff
         i = start
         for i in range(start + 1, len(self.regs)):
@@ -698,7 +700,8 @@ class RegBin(NamedTuple):
 
     @classmethod
     def from_ini(
-            cls, config: Mapping[str, Mapping[str, str]], filename='<unknown>'):
+            cls, config: Mapping[str, Mapping[str, str]],
+            filename: str = '<unknown>'):
         meta = config['Info']
         return cls(
             meta.get('version', 'unknown'), meta.get('datetime') or cls.now(),
@@ -824,7 +827,13 @@ def main():
         'file', metavar='chip.reg', type=argparse.FileType('rb'),
         help='binary reg file or ini file to parse')
 
-    args = parser.parse_args()
+    class MyArgs(argparse.Namespace):
+        output: BinaryIO | None
+        modify: bool
+        output_ini: TextIO | None
+        file: BinaryIO
+
+    args = parser.parse_args(namespace=MyArgs())
 
     data = args.file.read()
     if data[:1] == b'[':

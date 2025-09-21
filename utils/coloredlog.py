@@ -44,7 +44,7 @@ class Color(IntEnum):
     WHITE = 7
 
 
-def colored(s: str, color: int, bold=False):
+def colored(s: str, color: int, bold: bool = False):
     if not color:
         return s
     COLOR_SEQ = '\033[1;'
@@ -78,7 +78,7 @@ class ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 
-def setColoredLogger(logger: str | logging.Logger, verbose=False):
+def setColoredLogger(logger: str | logging.Logger, verbose: bool = False):
     """
     Set console output for logger of giver namespace.
 

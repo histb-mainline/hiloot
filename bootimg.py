@@ -2,11 +2,12 @@
 
 """Parse, split, or shrink `fastboot.bin`."""
 
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, BinaryIO, Generator
 
 if TYPE_CHECKING:
-    from _typeshed import ReadableBuffer
+    from _typeshed import ReadableBuffer, FileDescriptorOrPath
 
 
 __all__ = ['Memcpy', 'KeyRights', 'OTPID', 'BootParamError', 'BootParam']
@@ -16,13 +17,21 @@ def uint32(buf: bytes, offset: int) -> int:
     return int.from_bytes(buf[offset:offset + 4], 'little')
 
 
-class Memcpy(NamedTuple):
-    addr: int
+class Memcpy():
+    """Memory copy action."""
+
+    dst: int
     "destination address"
+    src: 'ReadableBuffer'
+    "source data"
     size: int
     "data size"
-    data: 'ReadableBuffer'
-    "data"
+
+    def __init__(
+            self, dst: int, src: 'ReadableBuffer', size: int | None = None):
+        self.dst = dst
+        self.src = src
+        self.size = size if size is not None else len(src)  # type: ignore
 
     def __bool__(self):
         """
@@ -32,12 +41,12 @@ class Memcpy(NamedTuple):
         """
         if not self.size:
             return False
-        view = memoryview(self.data)
+        view = memoryview(self.src)
         b = view[0]
         return any(x != b for x in view)
 
     def __bytes__(self):
-        return bytes(self.data)
+        return bytes(self.src)
 
     def __len__(self):
         return self.size
@@ -47,28 +56,39 @@ class Memcpy(NamedTuple):
             .format(self, type(self).__name__)
 
     def __getitem__(self, s: slice):
-        view = memoryview(self.data)[s]
-        return type(self)(self.addr + (s.start or 0), len(view), view)
+        view = memoryview(self.src)[s]
+        return type(self)(
+            self.dst + (s.start if s.start is not None else 0), view)
 
     @property
     def end(self):
-        return self.addr + self.size
+        """end address of the destination region"""
+        return self.dst + self.size
 
     @classmethod
-    def cut(cls, addr: int, size: int, data: 'ReadableBuffer', offset=0):
+    def move(
+            cls, base: int, data: 'ReadableBuffer', size: int, seek: int = 0):
+        """
+        Return a Memcpy object that moves `data` from `base` to `base + seek`.
+        """
         view = memoryview(data)
-        if size < 0 or addr < 0 or addr + size > len(view):
+        if size < 0 or base < 0 or base + size > len(view):
             raise ValueError
-        return cls(addr + offset, size, view[addr:addr + size])
+        return cls(base + seek, view[base:base + size])
 
     @classmethod
-    def cuts(cls, addr: int, size: int, data: 'ReadableBuffer', offset=0):
+    def moves(
+            cls, base: int, data: 'ReadableBuffer', size: int, seek: int = 0):
+        """
+        Return a list of Memcpy objects that move `data` from `base` to
+        `base + seek` in steps of `size`.
+        """
         view = memoryview(data)
-        if size < 0 or addr < 0 or addr + size > len(view):
+        if size < 0 or base < 0 or base + size > len(view):
             raise ValueError
         return [
-            cls(i + offset, size, view[i:i + size])
-            for i in range(addr, len(view), size)]
+            cls(i + seek, view[i:i + size])
+            for i in range(base, len(view), size)]
 
 
 class KeyRights(IntEnum):
@@ -94,7 +114,8 @@ class BootParamError(Exception):
     __slots__ = ()
 
 
-class BootParam(NamedTuple):
+@dataclass
+class BootParam:
     head: Memcpy
     aux: Memcpy
     asc: Memcpy
@@ -127,7 +148,7 @@ class BootParam(NamedTuple):
             'boot_store_addr={0.boot_store_addr:#x}, offset={0.offset:#x})'
             .format(self, type(self).__name__))
 
-    def __iter__(self):
+    def __iter__(self) -> Generator[tuple[str, Memcpy], Any, None]:
         yield 'head', self.head
         yield 'aux', self.aux
         yield 'asc', self.asc
@@ -161,14 +182,13 @@ class BootParam(NamedTuple):
                 raise BootParamError(
                     f'invalid v1 extra area size {extra_size:#x}')
 
-        head = Memcpy.cut(0, 0x3000, view)
-        aux = Memcpy.cut(head.end, uint32(view, 0x218), view)
-        asc = Memcpy.cut(aux.end, 0, view)
-        unchecked = Memcpy.cut(asc.end, 0x1000, view)
-        boot = Memcpy.cut(
-            unchecked.end, uint32(view, 0x408) - unchecked.size, view)
-        regs = Memcpy.cuts(
-            uint32(view, 0x2fe4), uint32(view, 0x2fe8), view)
+        head = Memcpy.move(0, view, 0x3000)
+        aux = Memcpy.move(head.end, view, uint32(view, 0x218))
+        asc = Memcpy.move(aux.end, view, 0)
+        unchecked = Memcpy.move(asc.end, view, 0x1000)
+        boot = Memcpy.move(
+            unchecked.end, view, uint32(view, 0x408) - unchecked.size)
+        regs = Memcpy.moves(uint32(view, 0x2fe4), view, uint32(view, 0x2fe8))
 
         return cls(
             head, aux, asc, unchecked, boot, regs, extra_size,
@@ -186,13 +206,13 @@ class BootParam(NamedTuple):
         multi_param = bool(uint32(view, 0x2fe0))
         boot_store_addr = uint32(view, 0x2fec)
 
-        head = Memcpy.cut(0, 0x3000, view, offset)
-        aux = Memcpy.cut(head.end, uint32(view, 0x214), view, offset)
-        asc = Memcpy.cut(aux.end, uint32(view, 0x218), view, offset)
-        unchecked = Memcpy.cut(asc.end, 0x1000, view, offset)
-        boot = Memcpy.cut(
-            unchecked.end, uint32(view, 0x2fe4) - unchecked.end, view, offset)
-        regs = Memcpy.cuts(boot.end, uint32(view, 0x2fe8), view, offset)
+        head = Memcpy.move(0, view, 0x3000, offset)
+        aux = Memcpy.move(head.end, view, uint32(view, 0x214), offset)
+        asc = Memcpy.move(aux.end, view, uint32(view, 0x218), offset)
+        unchecked = Memcpy.move(asc.end, view, 0x1000, offset)
+        boot = Memcpy.move(
+            unchecked.end, view, uint32(view, 0x2fe4) - unchecked.end, offset)
+        regs = Memcpy.moves(boot.end, view, uint32(view, 0x2fe8), offset)
 
         return cls(
             head, aux, asc, unchecked, boot, regs, 0,
@@ -209,13 +229,13 @@ class BootParam(NamedTuple):
         multi_param = True
         boot_store_addr = uint32(view, 0x2fec)
 
-        head = Memcpy.cut(0, 0x3000, view)
-        aux = Memcpy.cut(head.end, uint32(view, 0x214), view)
-        asc = Memcpy.cut(aux.end, uint32(view, 0x218), view)
-        unchecked = Memcpy.cut(asc.end, 0x1000, view)
-        boot = Memcpy.cut(
-            unchecked.end, uint32(view, 0x408) - unchecked.size, view)
-        regs = Memcpy.cuts(boot.end, uint32(view, 0x42c), view)
+        head = Memcpy.move(0, view, 0x3000)
+        aux = Memcpy.move(head.end, view, uint32(view, 0x214))
+        asc = Memcpy.move(aux.end, view, uint32(view, 0x218))
+        unchecked = Memcpy.move(asc.end, view, 0x1000)
+        boot = Memcpy.move(
+            unchecked.end, view, uint32(view, 0x408) - unchecked.size)
+        regs = Memcpy.moves(boot.end, view, uint32(view, 0x42c))
 
         return cls(
             head, aux, asc, unchecked, boot, regs, 0,
@@ -235,13 +255,13 @@ class BootParam(NamedTuple):
         multi_param = True
         boot_store_addr = uint32(view, 0x2fec)
 
-        head = Memcpy.cut(0, 0x3000, view, offset)
-        aux = Memcpy.cut(head.end, uint32(view, 0x214), view, offset)
-        asc = Memcpy.cut(aux.end, uint32(view, 0x218), view, offset)
-        unchecked = Memcpy.cut(asc.end, 0x1000, view, offset)
-        boot = Memcpy.cut(
-            unchecked.end, uint32(view, 0x408) - unchecked.size, view, offset)
-        regs = Memcpy.cuts(boot.end, uint32(view, 0x42c), view, offset)
+        head = Memcpy.move(0, view, 0x3000, offset)
+        aux = Memcpy.move(head.end, view, uint32(view, 0x214), offset)
+        asc = Memcpy.move(aux.end, view, uint32(view, 0x218), offset)
+        unchecked = Memcpy.move(asc.end, view, 0x1000, offset)
+        boot = Memcpy.move(
+            unchecked.end, view, uint32(view, 0x408) - unchecked.size, offset)
+        regs = Memcpy.moves(boot.end, view, uint32(view, 0x42c), offset)
 
         return cls(
             head, aux, asc, unchecked, boot, regs, 0,
@@ -267,7 +287,7 @@ def main():
     import os
     import sys
 
-    def dir_path(s):
+    def dir_path(s: FileDescriptorOrPath):
         if not os.path.isdir(s):
             raise NotADirectoryError(s)
         return s
@@ -289,7 +309,14 @@ def main():
     parser.add_argument(
         'version', type=int, help='boot param version')
 
-    args = parser.parse_args()
+    class MyArgs(argparse.Namespace):
+        dd: bool
+        split: str
+        output: BinaryIO | None
+        bootimg: BinaryIO
+        version: int
+
+    args = parser.parse_args(namespace=MyArgs())
 
     image = args.bootimg.read()
     try:
@@ -299,11 +326,11 @@ def main():
         return 1
 
     if not args.dd:
-        def print_memcpy(name: str, region: Memcpy, offset=0):
+        def print_memcpy(name: str, region: Memcpy, offset: int = 0):
             if not region:
                 return
             print(
-                f'{name}: {offset + region.addr:#8x}, '
+                f'{name}: {offset + region.dst:#8x}, '
                 f'{offset + region.end:#8x}  ({region.size:#7x})')
 
         print(
@@ -325,10 +352,10 @@ def main():
         for name, region in params:
             if not region:
                 continue
-            filename = f'{name}@{region.addr:x}.bin'
+            filename = f'{name}@{region.dst:x}.bin'
             if args.split:
                 with open(os.path.join(args.split, filename), 'wb') as f:
-                    f.write(region.data)
+                    f.write(region.src)
             if args.dd:
                 print(
                     '{cmd} if={src} of={dst} skip={addr} count={size}\n'
@@ -336,7 +363,7 @@ def main():
                     .format(
                         cmd='dd iflag=skip_bytes,count_bytes',
                         src=args.bootimg.name, dst=filename,
-                        addr=region.addr, size=region.size))
+                        addr=region.dst, size=region.size))
 
     file_end = params.last_pos()
 

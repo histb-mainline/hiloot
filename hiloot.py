@@ -10,7 +10,7 @@ import serial
 import serial.tools.miniterm
 from struct import Struct
 import sys
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, overload
+from typing import TYPE_CHECKING, BinaryIO, ClassVar, Literal, NamedTuple, overload
 
 from bootimg import OTPID, BootParam, BootParamError, Memcpy, uint32
 import chip_properties
@@ -156,7 +156,7 @@ class Frame(_Frame):
             self.STRUCT.pack(self.type, self.seq & 0xff, ~self.seq & 0xff) + \
             bytes(self.payload)
 
-    def to_bytes(self, with_crc=False):
+    def to_bytes(self, with_crc: bool = False):
         buf = bytes(self)
         return buf if not with_crc else \
             buf + binascii.crc_hqx(buf, 0).to_bytes(2, 'big')
@@ -168,7 +168,7 @@ class Frame(_Frame):
             binascii.crc_hqx(view[:-2], 0)
 
     @classmethod
-    def from_bytes(cls, buf: 'ReadableBuffer', with_crc=False):
+    def from_bytes(cls, buf: 'ReadableBuffer', with_crc: bool = False):
         view = memoryview(buf)
 
         if with_crc:
@@ -270,7 +270,8 @@ class Device(SerialMux):
         return Frame.from_bytes(memoryview(reply)[:-3])
 
     async def send_file(
-            self, addr: int, size: int, data: 'ReadableBuffer', name='data'):
+            self, addr: int, size: int, data: 'ReadableBuffer',
+            name: str = 'data'):
         """Send ``data`` to device memory ``addr``."""
         if not size:
             return
@@ -292,9 +293,9 @@ class Device(SerialMux):
 
         await self.send_frame(FrameType.TAIL, n + 1, b'')
 
-    def send_region(self, region: Memcpy, name='data'):
+    def send_region(self, region: Memcpy, name: str = 'data'):
         """Send ``region`` to device memory."""
-        return self.send_file(region.addr, region.size, region.data, name)
+        return self.send_file(region.dst, region.size, region.src, name)
 
     async def wait_boot(
             self, timeout: float | None = None, superfluous: int | None = None):
@@ -407,12 +408,12 @@ class Device(SerialMux):
         await asyncio.sleep(.5)
 
         if params.aux_enc_flag == OTPID.NORMAL:
-            await self.send_region(Memcpy.cut(
-                params.boot.end, 0x2a00, image), 'extra area')
+            await self.send_region(Memcpy.move(
+                params.boot.end, image, 0x2a00), 'extra area')
         elif params.aux_enc_flag == OTPID.SB and params.extra_size:
-            await self.send_region(Memcpy.cut(
-                params.boot.end + params.extra_size * self.boardvar,
-                params.extra_size, image), 'extra area')
+            await self.send_region(Memcpy.move(
+                params.boot.end + params.extra_size * self.boardvar, image,
+                params.extra_size), 'extra area')
 
         await self.send_region(params.regs[self.boardvar], 'reg')
         # auxiliary code will be executed here
@@ -421,8 +422,8 @@ class Device(SerialMux):
         # there is a big gap between params.head.addr and params.boot.addr,
         # however, the entry point is params.head.addr, all data must be sent
         # within one session
-        await self.send_region(Memcpy.cut(
-            params.head.addr, params.boot.end - params.head.addr, image
+        await self.send_region(Memcpy.move(
+            params.head.dst, image, params.boot.end - params.head.dst
         ), 'bootimg')
 
         if 2 <= self.chip.chipid <= 3 and self.chip.ca and \
@@ -466,7 +467,18 @@ async def main():
         type=argparse.FileType('rb'),
         help='chip properties (decrypted or encrypted) to use')
 
-    args = parser.parse_args()
+    class MyArgs(argparse.Namespace):
+        ser_path: str
+        bandrate: int
+        timeout: float
+        no_terminal: bool
+        debug: bool
+        break_only: bool
+        force: bool
+        bootimg: BinaryIO
+        properties: BinaryIO | None
+
+    args = parser.parse_args(namespace=MyArgs())
 
     logger = logging.getLogger(__name__)
 
@@ -483,7 +495,7 @@ async def main():
     devtype = DeviceType.LIBBOOTROM
     if not args.break_only:
         if not args.properties:
-            if not args.force and Memcpy.cut(0x4, 0x200 - 0x4, image):
+            if not args.force and Memcpy.move(0x4, image, 0x200 - 0x4):
                 print("""\
 ERROR: You have not specified chip properties file, but the boot image doesn't
        seem to be a Libbootrom image.

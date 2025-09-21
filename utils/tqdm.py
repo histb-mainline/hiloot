@@ -1,6 +1,6 @@
 import sys
 import time
-from typing import TYPE_CHECKING, Collection, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Collection, Protocol, TypeVar
 
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite, SupportsFlush
@@ -19,8 +19,8 @@ _T = TypeVar('_T')
 
 
 def tqdm(
-        it: Collection[_T], prefix='', ncols=80, unit='it',
-        file: '_SupportsWriteAndFlush[str] | None' = sys.stdout, **__):
+        it: Collection[_T], prefix: str = '', ncols: int = 80, unit: str = 'it',
+        file: '_SupportsWriteAndFlush[str] | None' = sys.stdout, **__: Any):
     count = len(it)
     digit = len(str(count))
     start = time.time()

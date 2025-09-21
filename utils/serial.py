@@ -110,7 +110,7 @@ class SerialMux:
 
     def __init__(
             self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, /,
-            logger: 'SupportsWrite[bytes] | None' = None, delimiter=0xaa,
+            logger: 'SupportsWrite[bytes] | None' = None, delimiter: int = 0xaa,
             restart: int | None = 17):
         self.reader = reader
         self.writer = writer
@@ -141,7 +141,7 @@ class SerialMux:
             self.logger.write(ret[0])
         return ret
 
-    async def read(self, nowait=False) -> tuple[bytes, bool]:
+    async def read(self, nowait: bool = False) -> tuple[bytes, bool]:
         """
         Get a reply.
 
@@ -224,7 +224,7 @@ class SerialMux:
         ret = False
         i = 0
         while True:
-            msg, binary = await self.read()
+            msg, _ = await self.read()
             if target(msg) if callable(target) else msg == target:
                 ret = True
                 break
@@ -251,7 +251,7 @@ class SerialMux:
             try:
                 async with asyncio.timeout(self.retry):
                     while True:
-                        reply, binary = await self.read()
+                        reply, _ = await self.read()
                         if want is None or want(reply):
                             return reply
             except asyncio.TimeoutError:
