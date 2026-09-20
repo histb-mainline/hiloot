@@ -9,9 +9,15 @@ __all__ = ['detect_serial', 'open_serial']
 
 
 def detect_serial():
-    infos = [
-        info for info in serial.tools.list_ports.comports()
-        if info.subsystem == 'usb-serial']
+    ports = serial.tools.list_ports.comports()
+    infos = [info for info in ports if info.subsystem == 'usb-serial']
+    if not infos:
+        # subsystem is only populated on Linux; fall back to matching common
+        # USB-serial adapter names so detection works on other platforms
+        keywords = ('serial', 'uart', 'ch34', 'cp21', 'ftdi', 'pl2303')
+        infos = [
+            info for info in ports
+            if any(k in (info.description or '').lower() for k in keywords)]
     if len(infos) == 0:
         print(
             'ERROR: No serial ports detected, use "-p PATH" to specify the '

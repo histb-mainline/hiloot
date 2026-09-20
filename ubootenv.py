@@ -7,8 +7,9 @@ U-Boot fw-utils `fw_printenv` / `fw_setenv` replacement, but more permissive.
 """
 
 import binascii
+import sys
 from collections import OrderedDict
-from typing import TYPE_CHECKING, BinaryIO, Mapping
+from typing import TYPE_CHECKING, Mapping
 
 if TYPE_CHECKING:
     from _typeshed import SupportsRead, SupportsWrite
@@ -35,7 +36,11 @@ def readenv(stream: 'SupportsRead[bytes]', size: int = 0):
     for kv in data.split(b'\0'):
         if not kv:
             break
-        key, value = kv.split(b'=', 1)
+        try:
+            key, value = kv.split(b'=', 1)
+        except ValueError:
+            print(f'Warning: malformed entry {kv!r}, skipped', file=sys.stderr)
+            continue
         environ[key] = value
 
     return environ, len(data) + 4, crc == real_crc
@@ -85,10 +90,10 @@ def main():
         '--ignore', action='store_true',
         help='do not show error message if CRC mismatched')
     parser.add_argument(
-        '--get', metavar='KEY', nargs='+', type=lambda x: x.encode(),
-        help='show values to these keys')
+        '--get', metavar='KEY', action='append', type=lambda x: x.encode(),
+        help='show value of key (may be specified multiple times)')
     parser.add_argument(
-        '-s', '--script', type=argparse.FileType('rb'),
+        '-s', '--script', metavar='FILE',
         help='read variables to be set from a script')
     parser.add_argument(
         '-o', metavar='file', dest='out_path',
@@ -101,7 +106,7 @@ def main():
         '--out-size', metavar='SIZE', dest='out_size', type=int,
         help='size of output environ (default: size of input environ, or 0x10000)')
     parser.add_argument(
-        'in_file', metavar='FILE', nargs='?', type=argparse.FileType('rb'),
+        'in_file', metavar='FILE', nargs='?',
         help='input file')
     parser.add_argument(
         'set', metavar='KEY=VALUE', nargs='*', type=lambda x: x.encode(),
@@ -113,11 +118,11 @@ def main():
         verify: bool
         ignore: bool
         get: list[bytes]
-        script: BinaryIO | None
+        script: str | None
         file: str
         out_offset: int
         out_size: int
-        in_file: BinaryIO | None
+        in_file: str | None
         set: list[bytes]
 
     args = parser.parse_args(namespace=MyArgs())
@@ -127,8 +132,13 @@ def main():
         return 1
 
     if args.in_file:
-        args.in_file.seek(args.in_offset)
-        (environ, size, crc_ok) = readenv(args.in_file, args.in_size)
+        try:
+            with open(args.in_file, 'rb') as in_file:
+                in_file.seek(args.in_offset)
+                (environ, size, crc_ok) = readenv(in_file, args.in_size)
+        except OSError as e:
+            parser.error(f"cannot read '{args.in_file}': {e}")
+
         if not crc_ok:
             if args.verify:
                 printerr('Error: Bad CRC')
@@ -153,7 +163,12 @@ def main():
 
     if args.out_path:
         if args.script:
-            for kv in args.script.read().splitlines():
+            try:
+                with open(args.script, 'rb') as script:
+                    lines = script.read().splitlines()
+            except OSError as e:
+                parser.error(f"cannot read '{args.script}': {e}")
+            for kv in lines:
                 if not kv or kv.startswith(b'#'):
                     continue
                 key, value = kv.split(b'=', 1)
@@ -162,14 +177,13 @@ def main():
             for kv in args.set:
                 key, value = kv.split(b'=', 1)
                 environ[key] = value
-        if os.path.isfile(args.out_path):
-            out_file = open(args.out_path, 'r+b')
-            out_file.seek(args.out_offset)
-        else:
-            out_file = open(args.out_path, 'wb')
-            if args.out_offset:
+        existing = os.path.isfile(args.out_path)
+        with open(args.out_path, 'r+b' if existing else 'wb') as out_file:
+            if existing:
+                out_file.seek(args.out_offset)
+            elif args.out_offset:
                 out_file.write(b'\0' * args.out_offset)
-        writeenv(out_file, environ, args.out_size or size)
+            writeenv(out_file, environ, args.out_size or size)
 
     return 0
 

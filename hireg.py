@@ -9,7 +9,7 @@ from collections import OrderedDict
 from datetime import datetime
 from enum import IntEnum
 from io import BufferedReader, BytesIO
-from typing import IO, TYPE_CHECKING, AnyStr, BinaryIO, Mapping, NamedTuple, TextIO
+from typing import IO, TYPE_CHECKING, AnyStr, BinaryIO, Mapping, NamedTuple
 import warnings
 
 if TYPE_CHECKING:
@@ -65,7 +65,10 @@ def writememn(buf: BinaryIO, b: bytes, n: int):
 
 
 def writestrn(buf: BinaryIO, s: str, n: int):
-    writememn(buf, s.encode(), n - 1)
+    data = s.encode()
+    if len(data) > n - 1:
+        raise ValueError(f'string too long for {n}-byte field: {s!r}')
+    writememn(buf, data, n - 1)
     buf.write(b'\0')
     return n
 
@@ -82,7 +85,7 @@ def to_enum(s: str | None, default: int = 0):
         try:
             return int(s, 0)
         except ValueError:
-            raise ValueError(f'"{s}" cannot be interrepreted as enum value')
+            raise ValueError(f'"{s}" cannot be interpreted as enum value')
 
 
 def to_bool(s: str | None, default: bool = False):
@@ -235,10 +238,15 @@ class Register(NamedTuple):
 
     def dump_v120(self, stream: BinaryIO):
         shift, count = self.sftcnt
+        if self.addr & 3:
+            raise ValueError(
+                f'register {self.addr:#x} is not 4-byte aligned; v120 stores '
+                'the offset shifted by 2 and cannot encode it')
 
         ret = 0
         ret += stream.write(bytes([
-            self.addr & 0xff, self.value_len_v120() << 5 | shift,
+            self.addr & 0xfc | self.readonly,
+            self.value_len_v120() << 5 | shift,
             self.delay_len_v120() << 5 | (count - 1)]))
         ret += stream.write(
             (self.value >> shift).to_bytes(self.value_len_v120(), 'big'))
@@ -273,10 +281,6 @@ class Register(NamedTuple):
     @staticmethod
     def has_more_reg(buf: BufferedReader):
         return bool(int.from_bytes(buf.peek(4)[:4]))
-
-    @staticmethod
-    def has_more_cfg(buf: BufferedReader):
-        return True
 
     @staticmethod
     def has_more_v120(buf: BufferedReader):
@@ -325,7 +329,8 @@ class Register(NamedTuple):
     @classmethod
     def load_v120(cls, buf: 'SupportsRead[bytes]', base: int):
         data = mustread(buf, 3)
-        addr = base + data[0]
+        readonly = bool(data[0] & 1)
+        addr = base + (data[0] & 0xfc)
         value_len = (data[1] & 0xe0) >> 5
         shift = data[1] & 0x1f
         delay_len = (data[2] & 0xe0) >> 5
@@ -337,7 +342,7 @@ class Register(NamedTuple):
 
         return cls(
             addr, value_sft << shift, ((2 << count_m1) - 1) << shift, delay,
-            False), None
+            readonly), None
 
 
 class RegModuleType(IntEnum):
@@ -427,10 +432,12 @@ class RegModule(NamedTuple):
         ret += stream.write(b'\0')
         ret += stream.write((size - 8).to_bytes(2, 'big'))
         ret += stream.write(base.to_bytes(4, 'big'))
-        assert ret == 8
+        if ret != 8:
+            raise ValueError('module header size mismatch')
 
         ret += sum(reg.dump_cfg(stream, base) for reg in self.regs)
-        assert ret == size
+        if ret != size:
+            raise ValueError('module size mismatch')
 
         return ret
 
@@ -444,7 +451,8 @@ class RegModule(NamedTuple):
         ret += stream.write(b'\0')
         ret += stream.write(flags.to_bytes())
         ret += stream.write((size - 4).to_bytes(2, 'big'))
-        assert ret == 4
+        if ret != 4:
+            raise ValueError('module header size mismatch')
 
         base = -1
         for i in range(len(self.regs)):
@@ -452,12 +460,18 @@ class RegModule(NamedTuple):
             new_base = reg.addr & ~0xff
             if base != new_base:
                 base = new_base
+                block = sum(self.regs[j].len_v120() for j in range(
+                    i, self.find_block_v120(i)))
+                if block > 0xff:
+                    raise ValueError(
+                        f'register block at {base:#x} is {block} bytes; v120 '
+                        'keeps the block length in the low byte of a 2-byte '
+                        'field, so it cannot exceed 0xff')
                 ret += stream.write(base.to_bytes(4, 'big'))
-                ret += stream.write(sum(
-                    self.regs[j].len_v120() for j in range(
-                        i, self.find_block_v120(i))).to_bytes())
+                ret += stream.write(block.to_bytes())
             ret += reg.dump_v120(stream)
-        assert ret == size
+        if ret != size:
+            raise ValueError('module size mismatch')
 
         return ret
 
@@ -481,8 +495,8 @@ class RegModule(NamedTuple):
 
     @staticmethod
     def has_more_cfg(buf: BufferedReader):
-        flags = buf.peek(1)
-        return flags and 1 <= flags[0] <= 3
+        sep = buf.peek(8)[:8]
+        return bool(sep) and sep != b'\xff' * 8
 
     @staticmethod
     def has_more_v120(buf: BufferedReader):
@@ -511,7 +525,8 @@ class RegModule(NamedTuple):
                 break
 
             reg, new_flags = Register.load_reg(buf)
-            assert new_flags == flags
+            if new_flags != flags:
+                raise ValueError('flags mismatch in consecutive registers')
             regs.append(reg)
 
         return cls(
@@ -529,6 +544,8 @@ class RegModule(NamedTuple):
         for _ in mustwithin(buf, size):
             op = buf.peek(1)[0]
             if op == 1:
+                if not regs:
+                    raise ValueError('delay opcode before any register')
                 addr, value, mask, delay, readonly = regs[-1]
                 mustread(buf)
                 delay += mustread(buf)[0]
@@ -581,6 +598,12 @@ class RegBin(NamedTuple):
     name: str
     "original file name"
     modules: list[RegModule]
+    tail: bytes | None = None
+    """
+    Raw region between the item offsets and the register table. Newer xlsm
+    templates insert a tool version string before the build date, so this is
+    echoed back verbatim instead of being rebuilt from the wrong fixed widths.
+    """
 
     def to_ini(self):
         ret = OrderedDict[str, OrderedDict[str, str]]()
@@ -595,26 +618,6 @@ class RegBin(NamedTuple):
             ret[f'Module {i}'] = module.to_ini()
 
         return ret
-
-    def len_reg(self):
-        size = 0xa0 + sum(module.len_reg() for module in self.modules)
-        size += 31
-        size = size & ~31
-        return size
-
-    def len_cfg(self):
-        return sum(module.len_cfg() for module in self.modules) + 8 + \
-            len(self.datetime.encode()) + 1 + len(self.name.encode()) + 1
-
-    def len_v120(self):
-        size = 0x20 + len(self.name.encode())
-        size += 3
-        size = size & ~3
-        for module in self.modules:
-            size += module.len_cfg()
-            size += 3
-            size = size & ~3
-        return size
 
     def _datetime(self, datetime: bool | str = False):
         if isinstance(datetime, str):
@@ -634,17 +637,22 @@ class RegBin(NamedTuple):
         ret += writestrn(stream, self.version, 0x10)
         ret += stream.write(item1_offset.to_bytes(4, 'little'))
         ret += stream.write(item2_offset.to_bytes(4, 'little'))
-        ret += stream.write(b'\0' * 0x28)
-        ret += writestrn(stream, self._datetime(datetime), 0x14)
-        ret += writestrn(stream, self.name, 0x4c)
-        assert ret == item1_offset
+        if self.tail is None or datetime:
+            ret += stream.write(b'\0' * 0x28)
+            ret += writestrn(stream, self._datetime(datetime), 0x14)
+            ret += writestrn(stream, self.name, 0x4c)
+        else:
+            ret += stream.write(self.tail)
+        if ret != item1_offset:
+            raise ValueError('reg file header size mismatch')
 
         for module in self.modules:
             ret += module.dump_reg(stream)
         if ret & 31:
             ret += stream.write(b'\0' * (32 - (ret & 31)))
         ret += stream.write(b'\0' * 32)  # reserved 1
-        assert ret == item2_offset
+        if ret != item2_offset:
+            raise ValueError('reg file item 1 size mismatch')
 
         ret += stream.write(b'\0' * 32)  # item 2
         ret += stream.write(b'\0' * 32)  # reserved 2
@@ -709,19 +717,18 @@ class RegBin(NamedTuple):
                 RegModule.from_ini(module) for name, module in config.items()
                 if name.startswith('Module ')])
 
-    @staticmethod
-    def has_more(buf: BufferedReader):
-        return bool(int.from_bytes(buf.peek(4)[:4]))
-
     @classmethod
     def load_reg(cls, buf: BufferedReader):
         version = bytes(mustread(buf, 0x10).rstrip(b'\0')).decode()
         item1_offset = int.from_bytes(mustread(buf, 4), 'little')
-        assert item1_offset == 0xa0
+        if item1_offset != 0xa0:
+            raise ValueError(
+                f'invalid item1 offset {item1_offset:#x}, expected 0xa0')
         item2_offset = int.from_bytes(mustread(buf, 4), 'little')
-        mustread(buf, 0x28)
-        datatime = bytes(mustread(buf, 0x14).rstrip(b'\0')).decode()
-        name = bytes(mustread(buf, 0x4c).rstrip(b'\0')).decode()
+        tail = mustread(buf, item1_offset - buf.tell())
+        fields = [field for field in tail.split(b'\0') if field]
+        datetime = fields[-2].decode() if len(fields) >= 2 else ''
+        name = fields[-1].decode() if fields else ''
 
         # item 1
         start = buf.tell()
@@ -733,17 +740,14 @@ class RegBin(NamedTuple):
         if size & 31:
             mustread(buf, 32 - (size & 31))
         mustread(buf, 32)  # reserved space
-        assert buf.tell() - start == item2_offset - item1_offset
+        if buf.tell() - start != item2_offset - item1_offset:
+            raise ValueError('reg file item 1 size mismatch')
 
         # item 2
-        size = 32
-        mustread(buf, size)
-
-        if size & 31:
-            buf.read(32 - (size & 31))
+        mustread(buf, 32)
         buf.read(32)  # reserved space
 
-        return cls(version, datatime, name, modules), None
+        return cls(version, datetime, name, modules, tail=tail), None
 
     @classmethod
     def load_cfg(cls, buf: BufferedReader):
@@ -752,28 +756,40 @@ class RegBin(NamedTuple):
             modules.append(RegModule.load_cfg(buf)[0])
 
         mustread(buf, 8)  # b'\xff' * 8
-        datatime = readuntil(buf, 0xff).decode()
+        datetime = readuntil(buf, 0xff).decode()
         name = readuntil(buf, 0xff).decode()
 
-        return cls('', datatime, name, modules), None
+        return cls('', datetime, name, modules), None
 
     @classmethod
     def load_v120(cls, buf: BufferedReader):
         mustread(buf, 4)
         version = bytes(mustread(buf, 8).rstrip(b'\0')).decode()
-        datatime = bytes(mustread(buf, 0x14).rstrip(b'\0')).decode()
+        datetime = bytes(mustread(buf, 0x14).rstrip(b'\0')).decode()
         name_a = readuntil(buf)
         name = bytes(name_a).decode()
 
-        size = len(name_a) + 1
-        if size & 3:
-            mustread(buf, 4 - (size & 3))
+        # Vendor templates disagree on whether the name terminator doubles as
+        # the reserved first byte of the module header, so the table starts on
+        # either of the next two 4-byte boundaries; take the one that decodes
+        # (the bootrom caps a module at 8192 bytes).
+        start = (buf.tell() + 2) & ~3
+        buf.seek(start)
+        head = buf.read(8)
+        for i in range(2):
+            probe = head[4 * i:4 * i + 4]
+            if len(probe) == 4 and not probe[0] and probe[1] and \
+                    0 < int.from_bytes(probe[2:4], 'big') <= 0x2000:
+                buf.seek(start + 4 * i)
+                break
+        else:
+            raise ValueError('no register module after the file name')
 
         modules: list[RegModule] = []
         while RegModule.has_more_v120(buf):
             modules.append(RegModule.load_v120(buf)[0])
 
-        return cls(version, datatime, name, modules), None
+        return cls(version, datetime, name, modules), None
 
     @classmethod
     def load(cls, buf: BufferedReader, format: RegBinFormat):
@@ -809,38 +825,48 @@ class RegBin(NamedTuple):
 
 def main():
     import argparse
+    import sys
     from configparser import ConfigParser
 
     parser = argparse.ArgumentParser(
         description='Parse or compile HiSTB bootrom system register initialization file.')
 
     parser.add_argument(
-        '-o', '--output', metavar='PATH', type=argparse.FileType('wb'),
+        '-o', '--output', metavar='PATH',
         help='output binary reg file')
     parser.add_argument(
         '-m', '--modify', action='store_true',
         help='set current build datetime in output reg file')
     parser.add_argument(
-        '-O', '--output-ini', metavar='PATH', type=argparse.FileType('w'),
+        '-O', '--output-ini', metavar='PATH',
         help='output editable ini file')
     parser.add_argument(
-        'file', metavar='chip.reg', type=argparse.FileType('rb'),
+        'file', metavar='chip.reg',
         help='binary reg file or ini file to parse')
 
     class MyArgs(argparse.Namespace):
-        output: BinaryIO | None
+        output: str | None
         modify: bool
-        output_ini: TextIO | None
-        file: BinaryIO
+        output_ini: str | None
+        file: str
 
     args = parser.parse_args(namespace=MyArgs())
 
-    data = args.file.read()
+    try:
+        with open(args.file, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        parser.error(f"cannot read '{args.file}': {e}")
     if data[:1] == b'[':
         config = ConfigParser()
         config.read_string(data.decode())
-        format = RegBinFormat[config['Bin']['format'].upper()]
-        regbin = RegBin.from_ini(config, args.file.name)
+        try:
+            format = RegBinFormat[config['Bin']['format'].upper()]
+        except (KeyError, ValueError) as e:
+            print(f'Error: invalid [Bin] section in ini file: {e}',
+                  file=sys.stderr)
+            return 1
+        regbin = RegBin.from_ini(config, args.file)
     else:
         regbin, format = RegBin.parse(data)
 
@@ -866,15 +892,23 @@ def main():
                 '============================================================')
     else:
         if args.output:
-            regbin.dump(
-                args.output, format, args.modify and RegBin.now())
+            try:
+                with open(args.output, 'wb') as output:
+                    regbin.dump(
+                        output, format, args.modify and RegBin.now())
+            except OSError as e:
+                parser.error(f"cannot write '{args.output}': {e}")
 
         if args.output_ini:
             config = ConfigParser()
             config.add_section('Bin')
             config['Bin']['format'] = str(format).lower()
             config.read_dict(regbin.to_ini())
-            config.write(args.output_ini)
+            try:
+                with open(args.output_ini, 'w') as output_ini:
+                    config.write(output_ini)
+            except OSError as e:
+                parser.error(f"cannot write '{args.output_ini}': {e}")
 
 
 if __name__ == '__main__':

@@ -33,14 +33,15 @@ def tqdm(
 
             ratio = j / count
             elapsed = time.time() - start
-            expect = elapsed * ((count - j) / j)
+            expect = elapsed * ((count - j) / j) if elapsed else 0
             elapsed_min, elapsed_sec = divmod(int(elapsed), 60)
             expect_min, expect_sec = divmod(int(expect), 60)
 
             head = f'{prefix}{ratio:4.0%}|'
             tail = (
                 f'| {j:{digit}}/{count} [{elapsed_min:02}:{elapsed_sec:02}<'
-                f'{expect_min:02}:{expect_sec:02}, {j / elapsed:.1f}{unit}/s]')
+                f'{expect_min:02}:{expect_sec:02}, '
+                f'{j / elapsed if elapsed else float("inf"):.1f}{unit}/s]')
 
             bar_size = ncols - len(head) - len(tail)
             bar_len = int(bar_size * ratio + .5)

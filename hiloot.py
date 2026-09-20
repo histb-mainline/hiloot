@@ -4,13 +4,14 @@
 
 import asyncio
 import binascii
+from configparser import NoSectionError
 from enum import IntEnum, auto
 import logging
 import serial
 import serial.tools.miniterm
 from struct import Struct
 import sys
-from typing import TYPE_CHECKING, BinaryIO, ClassVar, Literal, NamedTuple, overload
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, overload
 
 from bootimg import OTPID, BootParam, BootParamError, Memcpy, uint32
 import chip_properties
@@ -164,7 +165,7 @@ class Frame(_Frame):
     @classmethod
     def crc_valid(cls, buf: 'ReadableBuffer'):
         view = memoryview(buf)
-        return int.from_bytes(view[-2:], 'big') == \
+        return len(view) >= 2 and int.from_bytes(view[-2:], 'big') == \
             binascii.crc_hqx(view[:-2], 0)
 
     @classmethod
@@ -205,7 +206,7 @@ class Device(SerialMux):
     chip: ChipID | None
     boardvar: int | None
 
-    __slots__ = tuple(__annotations__)
+    __slots__ = ('timeout', 'logbuf', 'connected', 'chip', 'boardvar')
 
     def __init__(
             self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -370,7 +371,7 @@ class Device(SerialMux):
         view = memoryview(image)
         boot_size = uint32(view, 0x314)
         if 0x1800 + boot_size > len(view):
-            raise DeviceError('boot image imcomplete')
+            raise DeviceError('boot image incomplete')
 
         await asyncio.sleep(.1)
         await self.send_file(addr0, 0x1800, view[:0x1800], 'head data')
@@ -442,8 +443,8 @@ async def main():
         '-p', '--port', metavar='PATH', dest='ser_path',
         help='serial port to use (default: auto detect)')
     parser.add_argument(
-        '--rate', metavar='RATE', dest='bandrate', default=115200, type=int,
-        help='serial bandrate (default: 115200)')
+        '--rate', metavar='RATE', dest='baudrate', default=115200, type=int,
+        help='serial baud rate (default: 115200)')
     parser.add_argument(
         '--timeout', metavar='TIME', default=3., type=float,
         help='serial communication timeout in second (default: 3)')
@@ -460,23 +461,22 @@ async def main():
         '-f', '--force', action='store_true',
         help='force action, skip all internal checks')
     parser.add_argument(
-        'bootimg', metavar='fastboot.bin', type=argparse.FileType('rb'),
+        'bootimg', metavar='fastboot.bin',
         help='fastboot.bin to use')
     parser.add_argument(
         'properties', metavar='properties.chip', nargs='?',
-        type=argparse.FileType('rb'),
         help='chip properties (decrypted or encrypted) to use')
 
     class MyArgs(argparse.Namespace):
         ser_path: str
-        bandrate: int
+        baudrate: int
         timeout: float
         no_terminal: bool
         debug: bool
         break_only: bool
         force: bool
-        bootimg: BinaryIO
-        properties: BinaryIO | None
+        bootimg: str
+        properties: str | None
 
     args = parser.parse_args(namespace=MyArgs())
 
@@ -490,12 +490,17 @@ async def main():
         pass
 
     # parse chip properties
-    image = args.bootimg.read()
+    try:
+        with open(args.bootimg, 'rb') as f:
+            image = f.read()
+    except OSError as e:
+        parser.error(f"cannot read '{args.bootimg}': {e}")
     properties = None
     devtype = DeviceType.LIBBOOTROM
     if not args.break_only:
         if not args.properties:
-            if not args.force and Memcpy.move(0x4, image, 0x200 - 0x4):
+            if not args.force and (
+                    len(image) < 0x200 or Memcpy.move(0x4, image, 0x200 - 0x4)):
                 print("""\
 ERROR: You have not specified chip properties file, but the boot image doesn't
        seem to be a Libbootrom image.
@@ -510,13 +515,21 @@ Warning: No chip properties file specified, assuming Libbootrom.
          indefinitely.""", file=sys.stderr)
         else:
             try:
-                properties = chip_properties.load(args.properties.read())
+                with open(args.properties, 'rb') as f:
+                    properties = chip_properties.load(f.read())
             except Exception as e:
                 print(f"""\
-ERROR: Cannot load chip properties file "{args.properties.name}": {e}
+ERROR: Cannot load chip properties file "{args.properties}": {e}
        This is most likely caused by an wrong file path.""", file=sys.stderr)
                 return 253
-            prop_type = properties['Flash type & file system']
+            try:
+                prop_type = properties['Flash type & file system']
+            except (NoSectionError, KeyError) as e:
+                print(
+                    f'ERROR: Invalid chip properties file '
+                    f'"{args.properties}": missing section or key {e}',
+                    file=sys.stderr)
+                return 253
             if prop_type.get('BurnByLibBootrom') == '1':
                 devtype = DeviceType.LIBBOOTROM
             elif prop_type.get('CA') == '1':
@@ -525,71 +538,74 @@ ERROR: Cannot load chip properties file "{args.properties.name}": {e}
                 devtype = DeviceType.NON_CA
 
     # open serial
-    sers = await open_serial(args.ser_path, args.bandrate, logger)
+    sers = await open_serial(args.ser_path, args.baudrate, logger)
     if sers is None:
         return 1
     reader, writer, ser = sers
 
     # device
     dev = Device(reader, writer, args.timeout, args.debug)
-    del reader, writer
-    dev.logbuf = sys.stderr
+    del reader
 
     try:
-        await dev.connect()
+        try:
+            await dev.connect()
 
-        if args.break_only:
-            return 0
+            if args.break_only:
+                return 0
 
-        if devtype == DeviceType.LIBBOOTROM:
-            await dev.boot_libbootrom(image)
-        else:
-            assert properties is not None
-            prop_frame = properties['Frame Settings']
-            addr0 = int(prop_frame['ADDRESS0'], 0)
-            addr2 = int(prop_frame['ADDRESS2'], 0)
-
-            if devtype == DeviceType.CA:
-                await dev.boot_ca(image, addr0, addr2)
-            elif devtype == DeviceType.NON_CA:
-                ddrstep = chip_properties.decode_frame(prop_frame['DDRSTEP0'])
-                size0 = int(prop_frame['FILELEN0'], 0)
-                if len(ddrstep) != size0:
-                    raise BootParamError(
-                        'DDR step length mismatch: %d vs %d' % (
-                            len(ddrstep), size0))
-                addr1 = int(prop_frame['ADDRESS1'], 0)
-                size1 = int(prop_frame['FILELEN1'], 0)
-                await dev.boot_non_ca(
-                    image, addr0, ddrstep, addr1, size1, addr2)
+            if devtype == DeviceType.LIBBOOTROM:
+                await dev.boot_libbootrom(image)
             else:
-                raise DeviceError('device type not supported')
-    except (DeviceError, BootParamError) as e:
-        print('\nERROR: %s' % e, file=sys.stderr)
-        return 2
-    except asyncio.TimeoutError:
-        print('\nERROR: Timeout', file=sys.stderr)
-        return 3
-    except serial.SerialException as e:
-        print('\nERROR: Serial port error, %s' % e, file=sys.stderr)
-        return 4
+                assert properties is not None
+                prop_frame = properties['Frame Settings']
+                addr0 = int(prop_frame['ADDRESS0'], 0)
+                addr2 = int(prop_frame['ADDRESS2'], 0)
 
-    del dev
-    print('Bootstrap finished.', file=sys.stderr)
+                if devtype == DeviceType.CA:
+                    await dev.boot_ca(image, addr0, addr2)
+                elif devtype == DeviceType.NON_CA:
+                    ddrstep = chip_properties.decode_frame(
+                        prop_frame['DDRSTEP0'])
+                    size0 = int(prop_frame['FILELEN0'], 0)
+                    if len(ddrstep) != size0:
+                        raise BootParamError(
+                            'DDR step length mismatch: %d vs %d' % (
+                                len(ddrstep), size0))
+                    addr1 = int(prop_frame['ADDRESS1'], 0)
+                    size1 = int(prop_frame['FILELEN1'], 0)
+                    await dev.boot_non_ca(
+                        image, addr0, ddrstep, addr1, size1, addr2)
+                else:
+                    raise DeviceError('device type not supported')
+        except (DeviceError, BootParamError) as e:
+            print('\nERROR: %s' % e, file=sys.stderr)
+            return 2
+        except asyncio.TimeoutError:
+            print('\nERROR: Timeout', file=sys.stderr)
+            return 3
+        except (OSError, EOFError) as e:
+            print('\nERROR: Serial port error, %s' % e, file=sys.stderr)
+            return 4
 
-    if not args.no_terminal:
-        print(
-            '\n'
-            '============================================\n'
-            'Use Ctrl+] to exit, Ctrl+H Ctrl+T shows help\n'
-            '++++++++++++++++++++++++++++++++++++++++++++\n', file=sys.stderr)
+        del dev
+        print('Bootstrap finished.', file=sys.stderr)
 
-        term = serial.tools.miniterm.Miniterm(ser, eol='lf')
-        term.set_tx_encoding('utf-8')
-        term.set_rx_encoding('utf-8')
-        term.start()
-        term.join()
-    return 0
+        if not args.no_terminal:
+            print(
+                '\n'
+                '============================================\n'
+                'Use Ctrl+] to exit, Ctrl+H Ctrl+T shows help\n'
+                '++++++++++++++++++++++++++++++++++++++++++++\n', file=sys.stderr)
+
+            term = serial.tools.miniterm.Miniterm(ser, eol='lf')
+            term.set_tx_encoding('utf-8')
+            term.set_rx_encoding('utf-8')
+            term.start()
+            term.join()
+        return 0
+    finally:
+        writer.close()
 
 
 if __name__ == '__main__':

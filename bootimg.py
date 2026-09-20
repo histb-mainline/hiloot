@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, BinaryIO, Generator
+from typing import TYPE_CHECKING, Any, Generator
 
 if TYPE_CHECKING:
     from _typeshed import ReadableBuffer, FileDescriptorOrPath
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 __all__ = ['Memcpy', 'KeyRights', 'OTPID', 'BootParamError', 'BootParam']
 
 
-def uint32(buf: bytes, offset: int) -> int:
+def uint32(buf: bytes | bytearray | memoryview, offset: int) -> int:
     return int.from_bytes(buf[offset:offset + 4], 'little')
 
 
@@ -52,13 +52,14 @@ class Memcpy():
         return self.size
 
     def __repr__(self):
-        return '{1}(addr={0.addr:#x}, size={0.size:#x}, data={0.data!r})' \
+        return '{1}(dst={0.dst:#x}, size={0.size:#x}, data={0.src!r})' \
             .format(self, type(self).__name__)
 
     def __getitem__(self, s: slice):
-        view = memoryview(self.src)[s]
-        return type(self)(
-            self.dst + (s.start if s.start is not None else 0), view)
+        start = s.start if s.start is not None else 0
+        if start < 0 or s.step not in (None, 1):
+            raise ValueError('unsupported slice')
+        return type(self)(self.dst + start, memoryview(self.src)[s])
 
     @property
     def end(self):
@@ -73,7 +74,9 @@ class Memcpy():
         """
         view = memoryview(data)
         if size < 0 or base < 0 or base + size > len(view):
-            raise ValueError
+            raise BootParamError(
+                f'invalid region: base={base:#x} size={size:#x} '
+                f'file size={len(view):#x}')
         return cls(base + seek, view[base:base + size])
 
     @classmethod
@@ -85,7 +88,9 @@ class Memcpy():
         """
         view = memoryview(data)
         if size < 0 or base < 0 or base + size > len(view):
-            raise ValueError
+            raise BootParamError(
+                f'invalid region list: base={base:#x} size={size:#x} '
+                f'file size={len(view):#x}')
         return [
             cls(i + seek, view[i:i + size])
             for i in range(base, len(view), size)]
@@ -171,6 +176,10 @@ class BootParam:
                 f'v1 aux addr should be 0x3000, got {aux_addr:#x}')
 
         key_rights = uint32(view, 0x210)
+        # 0x40c is named SUPPORT_EXT_AREA_POS by hi3798mv2x.h and
+        # BOOT_ENC_FLAG_POS by hi3716mv420n.h; CONFIG_AUX_ENC_FLAG_POS is
+        # 0x2fc8 in both. Which word drives the extra area on v1 chips has
+        # not been confirmed against a real v1 fastboot image.
         flash_boot_enc_flag = uint32(view, 0x40c)
         aux_enc_flag = uint32(view, 0x40c)
         multi_param = bool(uint32(view, 0x2fe0))
@@ -301,10 +310,10 @@ def main():
         '-s', '--split', metavar='DIR', type=dir_path,
         help='output dir of split files (empty regions are skipped)')
     parser.add_argument(
-        '-o', '--output', metavar='PATH', type=argparse.FileType('wb'),
+        '-o', '--output', metavar='PATH',
         help='output path of shrinked file')
     parser.add_argument(
-        'bootimg', metavar='fastboot.bin', type=argparse.FileType('rb'),
+        'bootimg', metavar='fastboot.bin',
         help='fastboot.bin to use')
     parser.add_argument(
         'version', type=int, help='boot param version')
@@ -312,13 +321,17 @@ def main():
     class MyArgs(argparse.Namespace):
         dd: bool
         split: str
-        output: BinaryIO | None
-        bootimg: BinaryIO
+        output: str | None
+        bootimg: str
         version: int
 
     args = parser.parse_args(namespace=MyArgs())
 
-    image = args.bootimg.read()
+    try:
+        with open(args.bootimg, 'rb') as f:
+            image = f.read()
+    except OSError as e:
+        parser.error(f"cannot read '{args.bootimg}': {e}")
     try:
         params = BootParam.parse(args.version, image)
     except BootParamError as e:
@@ -362,7 +375,7 @@ def main():
                     '{cmd} conv=notrunc if={dst} of={src} seek={addr} count={size}\n'
                     .format(
                         cmd='dd iflag=skip_bytes,count_bytes',
-                        src=args.bootimg.name, dst=filename,
+                        src=args.bootimg, dst=filename,
                         addr=region.dst, size=region.size))
 
     file_end = params.last_pos()
@@ -373,7 +386,11 @@ def main():
                 '\nThis file can be shrinked to {0:#x} ({0}) bytes '
                 'from {1:#x} ({1}) bytes.'.format(file_end, len(image)))
     else:
-        args.output.write(image[:file_end])
+        try:
+            with open(args.output, 'wb') as output:
+                output.write(image[:file_end])
+        except OSError as e:
+            parser.error(f"cannot write '{args.output}': {e}")
         if file_end < len(image):
             print(
                 '\nFile shrinked to {0:#x} ({0}) bytes from {1:#x} ({1}) bytes.'

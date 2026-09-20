@@ -31,7 +31,7 @@ class SerialLogger:
     raw: bool
     "log all messages as raw bytes, useful for debugging but really flooding"
 
-    __slots__ = tuple(__annotations__)
+    __slots__ = ('buf', 'prefix', 'newline', 'raw')
 
     def __init__(self, buf: 'SupportsWrite[str]' = sys.stderr):
         self.buf = buf
@@ -106,7 +106,9 @@ class SerialMux:
     _buffer: bytearray
     _binary: bool
 
-    __slots__ = tuple(__annotations__)
+    __slots__ = (
+        'reader', 'writer', 'logger', 'delimiter', 'restart', 'retry',
+        '_buffer', '_binary')
 
     def __init__(
             self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, /,

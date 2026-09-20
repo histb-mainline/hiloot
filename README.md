@@ -1,10 +1,10 @@
 # HiLoot
 
-Open-source HiTool replacement, scripts for booting and mainpulating bootloader images for HiSTB SoCs.
+Open-source HiTool replacement, scripts for booting and manipulating bootloader images for HiSTB SoCs.
 
 ## hiloot
 
-* Dependency: `pyserial`, `pyserial-asyncio`, `tqdm` (optional)
+* Dependency: `pyserial`, `pyserial-asyncio`, `pycryptodome`, `tqdm` (optional)
 * Usage: `./hiloot.py <fastboot.bin>`
 
 Boot HiSTB devices via (USB-)serial port.

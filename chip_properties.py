@@ -34,12 +34,16 @@ def main():
         description='Decrypt Resources/Common/ChipProperties/*.chip.')
 
     parser.add_argument(
-        'file', metavar='type.chip', type=argparse.FileType('rb'),
+        'file', metavar='type.chip',
         help='file to decrypt')
 
     args = parser.parse_args()
 
-    data = args.file.read()
+    try:
+        with open(args.file, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        parser.error(f"cannot open '{args.file}': {e}")
     print(decrypt(data).decode('GBK'))
     return 0
 
